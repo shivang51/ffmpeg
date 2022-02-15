@@ -309,7 +309,12 @@
 
 #include <time.h>
 #include <stdio.h>  /* FILE */
-#include "libavcodec/avcodec.h"
+
+#include "libavcodec/codec.h"
+#include "libavcodec/codec_par.h"
+#include "libavcodec/defs.h"
+#include "libavcodec/packet.h"
+
 #include "libavutil/dict.h"
 #include "libavutil/log.h"
 
@@ -317,6 +322,7 @@
 #include "libavformat/version.h"
 
 struct AVFormatContext;
+struct AVStream;
 
 struct AVDeviceInfoList;
 struct AVDeviceCapabilitiesQuery;
@@ -457,6 +463,13 @@ typedef struct AVProbeData {
 /// Demuxer will use avio_open, no opened file should be provided by the caller.
 #define AVFMT_NOFILE        0x0001
 #define AVFMT_NEEDNUMBER    0x0002 /**< Needs '%d' in filename. */
+/**
+ * The muxer/demuxer is experimental and should be used with caution.
+ *
+ * - demuxers: will not be selected automatically by probing, must be specified
+ *             explicitly.
+ */
+#define AVFMT_EXPERIMENTAL  0x0004
 #define AVFMT_SHOW_IDS      0x0008 /**< Show format stream IDs numbers. */
 #define AVFMT_GLOBALHEADER  0x0040 /**< Format wants global header. */
 #define AVFMT_NOTIMESTAMPS  0x0080 /**< Format does not need / have any timestamps. */
@@ -530,6 +543,11 @@ typedef struct AVOutputFormat {
      */
     int priv_data_size;
 
+    /**
+     * Internal flags. See FF_FMT_FLAG_* in internal.h.
+     */
+    int flags_internal;
+
     int (*write_header)(struct AVFormatContext *);
     /**
      * Write a packet. If AVFMT_ALLOW_FLUSH is set in flags,
@@ -543,9 +561,21 @@ typedef struct AVOutputFormat {
     /**
      * A format-specific function for interleavement.
      * If unset, packets will be interleaved by dts.
+     *
+     * @param s           An AVFormatContext for output. pkt will be added to
+     *                    resp. taken from its packet buffer.
+     * @param[in,out] pkt A packet to be interleaved if has_packet is set;
+     *                    also used to return packets. If no packet is returned
+     *                    (e.g. on error), pkt is blank on return.
+     * @param flush       1 if no further packets are available as input and
+     *                    all remaining packets should be output.
+     * @param has_packet  If set, pkt contains a packet to be interleaved
+     *                    on input; otherwise pkt is blank on input.
+     * @return 1 if a packet was output, 0 if no packet could be output,
+     *         < 0 if an error occurred
      */
-    int (*interleave_packet)(struct AVFormatContext *, AVPacket *out,
-                             AVPacket *in, int flush);
+    int (*interleave_packet)(struct AVFormatContext *s, AVPacket *pkt,
+                             int flush, int has_packet);
     /**
      * Test if the given codec can be stored in this container.
      *
@@ -601,9 +631,13 @@ typedef struct AVOutputFormat {
     /**
      * Set up any necessary bitstream filtering and extract any extra data needed
      * for the global header.
+     *
+     * @note pkt might have been directly forwarded by a meta-muxer; therefore
+     *       pkt->stream_index as well as the pkt's timebase might be invalid.
      * Return 0 if more packets from this stream must be checked; 1 if not.
      */
-    int (*check_bitstream)(struct AVFormatContext *, const AVPacket *pkt);
+    int (*check_bitstream)(struct AVFormatContext *s, struct AVStream *st,
+                           const AVPacket *pkt);
 } AVOutputFormat;
 /**
  * @}
@@ -668,6 +702,11 @@ typedef struct AVInputFormat {
      * Size of private data so that it can be allocated in the wrapper.
      */
     int priv_data_size;
+
+    /**
+     * Internal flags. See FF_FMT_FLAG_* in internal.h.
+     */
+    int flags_internal;
 
     /**
      * Tell if a given file has a chance of being parsed as this format.
@@ -776,22 +815,56 @@ typedef struct AVIndexEntry {
     int min_distance;         /**< Minimum distance between this and the previous keyframe, used to avoid unneeded searching. */
 } AVIndexEntry;
 
-#define AV_DISPOSITION_DEFAULT   0x0001
-#define AV_DISPOSITION_DUB       0x0002
-#define AV_DISPOSITION_ORIGINAL  0x0004
-#define AV_DISPOSITION_COMMENT   0x0008
-#define AV_DISPOSITION_LYRICS    0x0010
-#define AV_DISPOSITION_KARAOKE   0x0020
+/**
+ * The stream should be chosen by default among other streams of the same type,
+ * unless the user has explicitly specified otherwise.
+ */
+#define AV_DISPOSITION_DEFAULT              (1 << 0)
+/**
+ * The stream is not in original language.
+ *
+ * @note AV_DISPOSITION_ORIGINAL is the inverse of this disposition. At most
+ *       one of them should be set in properly tagged streams.
+ * @note This disposition may apply to any stream type, not just audio.
+ */
+#define AV_DISPOSITION_DUB                  (1 << 1)
+/**
+ * The stream is in original language.
+ *
+ * @see the notes for AV_DISPOSITION_DUB
+ */
+#define AV_DISPOSITION_ORIGINAL             (1 << 2)
+/**
+ * The stream is a commentary track.
+ */
+#define AV_DISPOSITION_COMMENT              (1 << 3)
+/**
+ * The stream contains song lyrics.
+ */
+#define AV_DISPOSITION_LYRICS               (1 << 4)
+/**
+ * The stream contains karaoke audio.
+ */
+#define AV_DISPOSITION_KARAOKE              (1 << 5)
 
 /**
  * Track should be used during playback by default.
  * Useful for subtitle track that should be displayed
  * even when user did not explicitly ask for subtitles.
  */
-#define AV_DISPOSITION_FORCED    0x0040
-#define AV_DISPOSITION_HEARING_IMPAIRED  0x0080  /**< stream for hearing impaired audiences */
-#define AV_DISPOSITION_VISUAL_IMPAIRED   0x0100  /**< stream for visual impaired audiences */
-#define AV_DISPOSITION_CLEAN_EFFECTS     0x0200  /**< stream without voice */
+#define AV_DISPOSITION_FORCED               (1 << 6)
+/**
+ * The stream is intended for hearing impaired audiences.
+ */
+#define AV_DISPOSITION_HEARING_IMPAIRED     (1 << 7)
+/**
+ * The stream is intended for visually impaired audiences.
+ */
+#define AV_DISPOSITION_VISUAL_IMPAIRED      (1 << 8)
+/**
+ * The audio stream contains music and sound effects without voice.
+ */
+#define AV_DISPOSITION_CLEAN_EFFECTS        (1 << 9)
 /**
  * The stream is stored in the file as an attached picture/"cover art" (e.g.
  * APIC frame in ID3v2). The first (usually only) packet associated with it
@@ -799,23 +872,53 @@ typedef struct AVIndexEntry {
  * seeking takes place. It can also be accessed at any time in
  * AVStream.attached_pic.
  */
-#define AV_DISPOSITION_ATTACHED_PIC      0x0400
+#define AV_DISPOSITION_ATTACHED_PIC         (1 << 10)
 /**
  * The stream is sparse, and contains thumbnail images, often corresponding
  * to chapter markers. Only ever used with AV_DISPOSITION_ATTACHED_PIC.
  */
-#define AV_DISPOSITION_TIMED_THUMBNAILS  0x0800
-
-typedef struct AVStreamInternal AVStreamInternal;
+#define AV_DISPOSITION_TIMED_THUMBNAILS     (1 << 11)
 
 /**
- * To specify text track kind (different from subtitles default).
+ * The subtitle stream contains captions, providing a transcription and possibly
+ * a translation of audio. Typically intended for hearing-impaired audiences.
  */
-#define AV_DISPOSITION_CAPTIONS     0x10000
-#define AV_DISPOSITION_DESCRIPTIONS 0x20000
-#define AV_DISPOSITION_METADATA     0x40000
-#define AV_DISPOSITION_DEPENDENT    0x80000 ///< dependent audio stream (mix_type=0 in mpegts)
-#define AV_DISPOSITION_STILL_IMAGE 0x100000 ///< still images in video stream (still_picture_flag=1 in mpegts)
+#define AV_DISPOSITION_CAPTIONS             (1 << 16)
+/**
+ * The subtitle stream contains a textual description of the video content.
+ * Typically intended for visually-impaired audiences or for the cases where the
+ * video cannot be seen.
+ */
+#define AV_DISPOSITION_DESCRIPTIONS         (1 << 17)
+/**
+ * The subtitle stream contains time-aligned metadata that is not intended to be
+ * directly presented to the user.
+ */
+#define AV_DISPOSITION_METADATA             (1 << 18)
+/**
+ * The audio stream is intended to be mixed with another stream before
+ * presentation.
+ * Corresponds to mix_type=0 in mpegts.
+ */
+#define AV_DISPOSITION_DEPENDENT            (1 << 19)
+/**
+ * The video stream contains still images.
+ */
+#define AV_DISPOSITION_STILL_IMAGE          (1 << 20)
+
+/**
+ * @return The AV_DISPOSITION_* flag corresponding to disp or a negative error
+ *         code if disp does not correspond to a known stream disposition.
+ */
+int av_disposition_from_string(const char *disp);
+
+/**
+ * @param disposition a combination of AV_DISPOSITION_* values
+ * @return The string description corresponding to the lowest set bit in
+ *         disposition. NULL when the lowest set bit does not correspond
+ *         to a known disposition or when disposition is 0.
+ */
+const char *av_disposition_to_string(int disposition);
 
 /**
  * Options for behavior on timestamp wrap detection.
@@ -832,6 +935,13 @@ typedef struct AVStreamInternal AVStreamInternal;
  * sizeof(AVStream) must not be used outside libav*.
  */
 typedef struct AVStream {
+#if FF_API_AVSTREAM_CLASS
+    /**
+     * A class for @ref avoptions. Set on stream creation.
+     */
+    const AVClass *av_class;
+#endif
+
     int index;    /**< stream index in AVFormatContext */
     /**
      * Format-specific stream ID.
@@ -878,7 +988,13 @@ typedef struct AVStream {
 
     int64_t nb_frames;                 ///< number of frames in this stream if known or 0
 
-    int disposition; /**< AV_DISPOSITION_* bit field */
+    /**
+     * Stream disposition - a combination of AV_DISPOSITION_* flags.
+     * - demuxing: set by libavformat when creating the stream or in
+     *             avformat_find_stream_info().
+     * - muxing: may be set by the caller before avformat_write_header().
+     */
+    int disposition;
 
     enum AVDiscard discard; ///< Selects which packets can be discarded at will and do not need to be demuxed.
 
@@ -980,34 +1096,14 @@ typedef struct AVStream {
      */
     AVCodecParameters *codecpar;
 
-    /*****************************************************************
-     * All fields below this line are not part of the public API. They
-     * may not be used outside of libavformat and can be changed and
-     * removed at will.
-     * Internal note: be aware that physically removing these fields
-     * will break ABI. Replace removed fields with dummy fields, and
-     * add new fields to AVStreamInternal.
-     *****************************************************************
-     */
-
-    int pts_wrap_bits; /**< number of bits in pts (used for wrapping control) */
-
-    // Timestamp generation support:
     /**
-     * Timestamp corresponding to the last dts sync point.
+     * Number of bits in timestamps. Used for wrapping control.
      *
-     * Initialized when AVCodecParserContext.dts_sync_point >= 0 and
-     * a DTS is received from the underlying container. Otherwise set to
-     * AV_NOPTS_VALUE by default.
+     * - demuxing: set by libavformat
+     * - muxing: set by libavformat
+     *
      */
-    int64_t first_dts;
-    int64_t cur_dts;
-
-    /**
-     * An opaque field for libavformat internal usage.
-     * Must not be accessed in any way by callers.
-     */
-    AVStreamInternal *internal;
+    int pts_wrap_bits;
 } AVStream;
 
 struct AVCodecParserContext *av_stream_get_parser(const AVStream *s);
@@ -1088,8 +1184,6 @@ enum AVDurationEstimationMethod {
     AVFMT_DURATION_FROM_STREAM, ///< Duration estimated from a stream with a known duration
     AVFMT_DURATION_FROM_BITRATE ///< Duration estimated from bitrate (less accurate)
 };
-
-typedef struct AVFormatInternal AVFormatInternal;
 
 /**
  * Format I/O context.
@@ -1250,9 +1344,15 @@ typedef struct AVFormatContext {
 #define AVFMT_FLAG_AUTO_BSF   0x200000 ///< Add bitstream filters as requested by the muxer
 
     /**
-     * Maximum size of the data read from input for determining
-     * the input container format.
+     * Maximum number of bytes read from input in order to determine stream
+     * properties. Used when reading the global header and in
+     * avformat_find_stream_info().
+     *
      * Demuxing only, set by the caller before avformat_open_input().
+     *
+     * @note this is \e not  used for determining the \ref AVInputFormat
+     *       "input format"
+     * @sa format_probesize
      */
     int64_t probesize;
 
@@ -1427,12 +1527,13 @@ typedef struct AVFormatContext {
     /**
      * Avoid negative timestamps during muxing.
      * Any value of the AVFMT_AVOID_NEG_TS_* constants.
-     * Note, this only works when using av_interleaved_write_frame. (interleave_packet_per_dts is in use)
+     * Note, this works better when using av_interleaved_write_frame().
      * - muxing: Set by user
      * - demuxing: unused
      */
     int avoid_negative_ts;
 #define AVFMT_AVOID_NEG_TS_AUTO             -1 ///< Enabled when required by target format
+#define AVFMT_AVOID_NEG_TS_DISABLED          0 ///< Do not shift timestamps even when they are negative.
 #define AVFMT_AVOID_NEG_TS_MAKE_NON_NEGATIVE 1 ///< Shift timestamps so they are non negative
 #define AVFMT_AVOID_NEG_TS_MAKE_ZERO         2 ///< Shift timestamps so that they start at 0
 
@@ -1527,9 +1628,13 @@ typedef struct AVFormatContext {
     int probe_score;
 
     /**
-     * number of bytes to read maximally to identify format.
-     * - encoding: unused
-     * - decoding: set by user
+     * Maximum number of bytes read from input in order to identify the
+     * \ref AVInputFormat "input format". Only used when the format is not set
+     * explicitly by the caller.
+     *
+     * Demuxing only, set by the caller before avformat_open_input().
+     *
+     * @sa probesize
      */
     int format_probesize;
 
@@ -1548,12 +1653,6 @@ typedef struct AVFormatContext {
      * - decoding: set by user
      */
     char *format_whitelist;
-
-    /**
-     * An opaque field for libavformat internal usage.
-     * Must not be accessed in any way by callers.
-     */
-    AVFormatInternal *internal;
 
     /**
      * IO repositioned flag.
@@ -1695,6 +1794,19 @@ typedef struct AVFormatContext {
      * - decoding: set by user
      */
     int max_probe_packets;
+
+    /**
+     * A callback for closing the streams opened with AVFormatContext.io_open().
+     *
+     * Using this is preferred over io_close, because this can return an error.
+     * Therefore this callback is used instead of io_close by the generic
+     * libavformat code if io_close is NULL or the default.
+     *
+     * @param s the format context
+     * @param pb IO context to be closed and freed
+     * @return 0 on success, a negative AVERROR code on failure
+     */
+    int (*io_close2)(struct AVFormatContext *s, AVIOContext *pb);
 } AVFormatContext;
 
 /**
@@ -1798,6 +1910,14 @@ void avformat_free_context(AVFormatContext *s);
  * @see av_opt_find().
  */
 const AVClass *avformat_get_class(void);
+
+/**
+ * Get the AVClass for AVStream. It can be used in combination with
+ * AV_OPT_SEARCH_FAKE_OBJ for examining options.
+ *
+ * @see av_opt_find().
+ */
+const AVClass *av_stream_get_class(void);
 
 /**
  * Add a new stream to a media file.
@@ -2253,7 +2373,7 @@ int av_write_frame(AVFormatContext *s, AVPacket *pkt);
  * Write a packet to an output media file ensuring correct interleaving.
  *
  * This function will buffer the packets internally as needed to make sure the
- * packets in the output file are properly interleaved in the order of
+ * packets in the output file are properly interleaved, usually ordered by
  * increasing dts. Callers doing their own interleaving should call
  * av_write_frame() instead of this function.
  *
@@ -2266,10 +2386,10 @@ int av_write_frame(AVFormatContext *s, AVPacket *pkt);
  *            <br>
  *            If the packet is reference-counted, this function will take
  *            ownership of this reference and unreference it later when it sees
- *            fit.
- *            The caller must not access the data through this reference after
- *            this function returns. If the packet is not reference-counted,
- *            libavformat will make a copy.
+ *            fit. If the packet is not reference-counted, libavformat will
+ *            make a copy.
+ *            The returned packet will be blank (as if returned from
+ *            av_packet_alloc()), even on error.
  *            <br>
  *            This parameter can be NULL (at any time, not just at the end), to
  *            flush the interleaving queues.
@@ -2285,10 +2405,9 @@ int av_write_frame(AVFormatContext *s, AVPacket *pkt);
  *            The dts for subsequent packets in one stream must be strictly
  *            increasing (unless the output format is flagged with the
  *            AVFMT_TS_NONSTRICT, then they merely have to be nondecreasing).
- *            @ref AVPacket.duration "duration") should also be set if known.
+ *            @ref AVPacket.duration "duration" should also be set if known.
  *
- * @return 0 on success, a negative AVERROR on error. Libavformat will always
- *         take care of freeing the packet, even if this function fails.
+ * @return 0 on success, a negative AVERROR on error.
  *
  * @see av_write_frame(), AVFormatContext.max_interleave_delta
  */
